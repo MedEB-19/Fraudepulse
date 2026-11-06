@@ -1,0 +1,38 @@
+# Optional: Prometheus + Pushgateway + Grafana
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+volumes:
+  prometheus_data:
+  grafana_data:
+
+services:
+  pushgateway:
+    image: prom/pushgateway:v1.6.0
+    container_name: pushgateway
+    restart: unless-stopped
+    ports: ["9091:9091"]
+    networks: [fraudpulse_net]
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports: ["9090:9090"]
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks: [fraudpulse_net]
+
+  grafana:
+    image: grafana/grafana:10.0.3
+    container_name: grafana
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change_me}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+    networks: [fraudpulse_net]

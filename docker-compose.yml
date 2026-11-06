@@ -1,0 +1,227 @@
+# FraudPulse v2 - core pipeline (everything is Python except the infrastructure images)
+#   kafka -> spark streaming (PySpark + XGBoost) -> mongodb -> streamlit dashboard
+name: fraudpulse
+
+x-spark-env: &spark-env
+  PYSPARK_PYTHON: python3
+  KAFKA_BROKER: kafka:29092
+  KAFKA_TOPIC: ${KAFKA_TOPIC:-fraud-transactions}
+  KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-fraud-transactions-dlq}
+  MONGO_URI: ${MONGO_URI:-mongodb://mongodb:27017/}
+  MONGO_DB: ${MONGO_DB:-fraud_db}
+  MONGO_COLLECTION: ${MONGO_COLLECTION:-transactions}
+  FRAUD_THRESHOLD: ${FRAUD_THRESHOLD:-0.5}
+  RULE_AMOUNT: ${RULE_AMOUNT:-200000}
+  STARTING_OFFSETS: ${STARTING_OFFSETS:-earliest}
+  MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-5000}
+  TRIGGER_SECONDS: ${TRIGGER_SECONDS:-5}
+  PROMETHEUS_PUSHGATEWAY: ${PROMETHEUS_PUSHGATEWAY:-}
+  MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-}
+  MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-FraudPulse-XGBoost}
+  XGB_NUM_WORKERS: ${XGB_NUM_WORKERS:-2}
+  TRAIN_SAMPLE_FRACTION: ${TRAIN_SAMPLE_FRACTION:-1.0}
+  DATA_PATH: /app/data/paysim.csv
+  MODEL_DIR: /app/models
+
+x-spark-build: &spark-build
+  context: .
+  dockerfile: docker/spark/Dockerfile
+
+# models/ and data/ are mounted at the SAME path in every Spark container: workers
+# read the CSV and write/read the model files directly.
+x-spark-volumes: &spark-volumes
+  - ./models:/app/models
+  - ./data:/app/data
+
+networks:
+  fraudpulse_net:
+
+volumes:
+  kafka_data:
+  mongo_data:
+  spark_checkpoints:
+  ivy_cache:
+
+services:
+  # ───────────── Kafka (KRaft, no ZooKeeper) ─────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    restart: unless-stopped
+    ports: ["9092:9092"]
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG_RETENTION_HOURS: 72
+    volumes: [kafka_data:/var/lib/kafka/data]
+    networks: [fraudpulse_net]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 15s
+      retries: 10
+      start_period: 40s
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init
+    depends_on:
+      kafka: {condition: service_healthy}
+    networks: [fraudpulse_net]
+    volumes: ["./scripts/init_kafka_topics.sh:/init.sh:ro"]
+    environment:
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-fraud-transactions}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-fraud-transactions-dlq}
+      KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-6}
+    entrypoint: ["/bin/bash", "/init.sh"]
+    restart: "no"
+
+  # ───────────── MongoDB ─────────────
+  mongodb:
+    image: mongo:6.0.12
+    container_name: mongodb
+    restart: unless-stopped
+    ports: ["27017:27017"]
+    volumes:
+      - mongo_data:/data/db
+      - ./src/mongo/init_mongo.js:/docker-entrypoint-initdb.d/init.js:ro
+    networks: [fraudpulse_net]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ───────────── Spark standalone cluster (1 master + 2 workers) ─────────────
+  spark-master:
+    build: *spark-build
+    image: fraudpulse-spark:2.0
+    container_name: spark-master
+    restart: unless-stopped
+    command: spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+    ports: ["8080:8080", "7077:7077"]
+    networks: [fraudpulse_net]
+
+  spark-worker-1: &spark-worker
+    image: fraudpulse-spark:2.0
+    container_name: spark-worker-1
+    restart: unless-stopped
+    depends_on: [spark-master]
+    command: spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --cores 2 --memory 3g --webui-port 8081
+    environment: *spark-env
+    volumes: *spark-volumes
+    networks: [fraudpulse_net]
+
+  spark-worker-2:
+    <<: *spark-worker
+    container_name: spark-worker-2
+    command: spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --cores 2 --memory 3g --webui-port 8082
+
+  # ───────────── Streaming job: Kafka -> XGBoost -> MongoDB ─────────────
+  spark-stream:
+    image: fraudpulse-spark:2.0
+    container_name: spark-stream
+    restart: on-failure
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+      mongodb: {condition: service_healthy}
+      spark-master: {condition: service_started}
+    environment: *spark-env
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - spark_checkpoints:/app/checkpoints
+      - ivy_cache:/tmp/ivy
+    networks: [fraudpulse_net]
+    command: >
+      spark-submit --master spark://spark-master:7077
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
+      --conf spark.jars.ivy=/tmp/ivy
+      --conf spark.driver.host=spark-stream
+      --conf spark.driver.bindAddress=0.0.0.0
+      --conf spark.driver.port=7078
+      --conf spark.blockManager.port=7079
+      --conf spark.cores.max=2
+      --conf spark.executor.cores=1
+      --conf spark.executor.memory=1g
+      /app/src/jobs/stream.py
+
+  # ───────────── Training job (run on demand: `make train`) ─────────────
+  trainer:
+    image: fraudpulse-spark:2.0
+    container_name: fraudpulse-trainer
+    profiles: ["train"]
+    depends_on: [spark-master]
+    environment: *spark-env
+    volumes: *spark-volumes
+    networks: [fraudpulse_net]
+    command: >
+      spark-submit --master spark://spark-master:7077
+      --conf spark.driver.host=fraudpulse-trainer
+      --conf spark.driver.bindAddress=0.0.0.0
+      --conf spark.driver.port=7080
+      --conf spark.blockManager.port=7081
+      --conf spark.cores.max=2
+      --conf spark.executor.cores=1
+      --conf spark.executor.memory=2g
+      --conf spark.driver.memory=1g
+      /app/src/jobs/train.py
+
+  # ───────────── Producer (CSV -> Kafka) ─────────────
+  producer:
+    build: ./src/producer
+    container_name: producer
+    restart: on-failure
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+    environment:
+      KAFKA_BROKER: kafka:29092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-fraud-transactions}
+      STREAM_DELAY_SECONDS: ${STREAM_DELAY_SECONDS:-0.05}
+      PRODUCER_LOOP: ${PRODUCER_LOOP:-false}
+      MAX_RECORDS: ${MAX_RECORDS:-0}
+      PRODUCER_DATA: /app/data/paysim.csv
+    volumes: ["./data:/app/data:ro"]
+    ports: ["8001:8001"]
+    networks: [fraudpulse_net]
+
+  # ───────────── Model server (REST) ─────────────
+  model-server:
+    build:
+      context: .
+      dockerfile: src/model_server/Dockerfile
+    container_name: model-server
+    restart: unless-stopped
+    environment:
+      MODEL_PATH: /app/models/fraud_model.json
+      FRAUD_THRESHOLD: ${FRAUD_THRESHOLD:-0.5}
+    volumes: ["./models:/app/models:ro"]
+    ports: ["8000:8000"]
+    networks: [fraudpulse_net]
+
+  # ───────────── Dashboard ─────────────
+  dashboard:
+    build: ./src/dashboard
+    container_name: dashboard
+    restart: unless-stopped
+    depends_on:
+      mongodb: {condition: service_healthy}
+    environment:
+      MONGO_URI: ${MONGO_URI:-mongodb://mongodb:27017/}
+      MONGO_DB: ${MONGO_DB:-fraud_db}
+      MONGO_COLLECTION: ${MONGO_COLLECTION:-transactions}
+    ports: ["8501:8501"]
+    networks: [fraudpulse_net]
